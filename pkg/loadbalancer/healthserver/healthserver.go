@@ -144,6 +144,8 @@ func (s *healthServer) controlLoop(ctx context.Context, health cell.Health) erro
 				port > 0 &&
 				svc.ExtTrafficPolicy == lb.SVCTrafficPolicyLocal
 
+			// ---
+
 			// Check if a health checker server exists already for this service and remove it if port has changed
 			// or if the service is no longer applicable.
 			// NOTE: A complication here is that we may have both a NodePort and a LoadBalancer frontend and

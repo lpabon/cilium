@@ -19,6 +19,8 @@ import (
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/job"
 	"github.com/cilium/statedb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +38,7 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
 	slim_meta_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/k8s/utils"
+	lb "github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/shortener"
@@ -134,6 +137,29 @@ func NewL2Announcer(params l2AnnouncerParams) *L2Announcer {
 
 	return announcer
 }
+
+/*
+func (l2a *L2Announcer) EndpointCount(name lb.ServiceName) int {
+
+	txn := l2a.params.StateDB.ReadTxn()
+	var backends statedb.Table[*lb.Backend]
+	nodeName := nodeTypes.GetName()
+	backends = l2a.params.back
+
+	activeCount := 0
+	for be := range backends.List(txn, lb.BackendByServiceName(name)) {
+		inst := be.GetInstance(name)
+		if inst.NodeName != "" && inst.NodeName != nodeName {
+			// Skip non-local backends.
+			continue
+		}
+		if inst.State == lb.BackendStateActive {
+			activeCount++
+		}
+	}
+	return activeCount
+}
+*/
 
 func (l2a *L2Announcer) run(ctx context.Context, health cell.Health) error {
 	var err error
@@ -326,6 +352,39 @@ func (l2a *L2Announcer) upsertSvc(svc *slim_corev1.Service) error {
 	}
 	if noExternal && noLB {
 		return l2a.delSvc(key)
+	}
+
+	l2a.params.Logger.Info("LUIS")
+
+	// if the service is local only and we are not on the node, then let's not
+	// participate in the leader election
+	if svc.Spec.ExternalTrafficPolicy ==
+		slim_corev1.ServiceExternalTrafficPolicy(lb.SVCTrafficPolicyLocal) {
+
+		releaseLease := false
+
+		// Get port number
+		port := svc.Spec.HealthCheckNodePort
+		if port <= 0 {
+			l2a.params.Logger.Error("LUIS HealthCheckNodePort is zero")
+			releaseLease = true
+		}
+
+		// Determine if we should be announcing for this service
+		ok, err := l2a.checkHealthStatus(port)
+		if err != nil {
+			l2a.params.Logger.Error(fmt.Sprintf("LUIS unable to check health of service: %v", err))
+			releaseLease = true
+		}
+		if !ok {
+			l2a.params.Logger.Info("LUIS this host does not have the locals")
+			releaseLease = true
+		}
+
+		if releaseLease {
+			return l2a.delSvc(key)
+		}
+		l2a.params.Logger.Info("LUIS this host DOES have the locals")
 	}
 
 	// Ignore services managed by an unsupported load balancer class.
@@ -761,6 +820,94 @@ func (l2a *L2Announcer) leaseTimings() (leaseDuration, renewDeadline, retryPerio
 	}
 
 	return leaseDuration, renewDeadline, retryPeriod
+}
+
+// WaitFor() waits until f() returns false or err != nil
+// f() returns <wait as bool, or err>.
+func WaitFor(timeout time.Duration, period time.Duration, f func() (bool, error)) error {
+	timeoutChan := time.After(timeout)
+	var (
+		wait bool = true
+		err  error
+	)
+	for wait {
+		select {
+		case <-timeoutChan:
+			return status.Errorf(codes.DeadlineExceeded, "Timed out")
+		default:
+			wait, err = f()
+			if err != nil {
+				return err
+			}
+			time.Sleep(period)
+		}
+	}
+
+	return nil
+}
+
+// HealthCheckResponse defines the structure of the JSON response from the health check endpoint.
+// Using a struct makes it easy and safe to parse the JSON.
+type HealthCheckResponse struct {
+	Service struct {
+		Namespace string `json:"namespace"`
+		Name      string `json:"name"`
+	} `json:"service"`
+	LocalEndpoints int `json:"localEndpoints"`
+}
+
+// CheckHealthStatus performs a health check against the provided URL.
+// It returns true if the service is healthy (status 200 and localEndpoints > 0),
+// otherwise it returns false and an error describing the issue.
+func (l2a *L2Announcer) checkHealthStatus(port int32) (bool, error) {
+	// LUIS
+	// Perform the HTTP GET request.
+	var (
+		resp *http.Response
+		waitErr error
+	)
+	err := WaitFor(60*time.Second, 1*time.Second, func () (bool, error) {
+		resp, waitErr = http.Get(fmt.Sprintf("http://localhost:%d", port))
+		if waitErr != nil {
+			l2a.params.Logger.Error(fmt.Sprintf("failed to make HTTP request: %w", waitErr))
+			return true, nil
+		}
+
+		return false, nil
+	})
+	if err != nil {
+		return false, waitErr
+	}
+
+	// Ensure the response body is closed when the function returns.
+	defer resp.Body.Close()
+
+	// First, check if the HTTP status code is 200 OK.
+	// The user's example shows 503, so we handle non-200 cases.
+	if resp.StatusCode != http.StatusOK {
+		// Read the body to include it in the error message for more context.
+		return false, fmt.Errorf("health check failed with status code %d", resp.StatusCode)
+	}
+
+	// The status is 200, so now we parse the JSON body.
+	var healthData HealthCheckResponse
+	if err := json.NewDecoder(resp.Body).Decode(&healthData); err != nil {
+		return false, fmt.Errorf("failed to decode JSON response: %w", err)
+	}
+
+	// Finally, check if the number of local endpoints is greater than 0.
+	if healthData.LocalEndpoints > 0 {
+		l2a.params.Logger.Info(fmt.Sprintf(
+			"Health check successful for service %s/%s. Local Endpoints: %d\n",
+			healthData.Service.Namespace,
+			healthData.Service.Name,
+			healthData.LocalEndpoints,
+		))
+		return true, nil
+	}
+
+	// If we reach here, it means localEndpoints was 0 or less.
+	return false, fmt.Errorf("service is unhealthy: localEndpoints is %d", healthData.LocalEndpoints)
 }
 
 func (l2a *L2Announcer) addSelectedService(svc *slim_corev1.Service, byPolicies []resource.Key) {
