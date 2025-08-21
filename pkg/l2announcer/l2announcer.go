@@ -354,7 +354,7 @@ func (l2a *L2Announcer) upsertSvc(svc *slim_corev1.Service) error {
 		return l2a.delSvc(key)
 	}
 
-	l2a.params.Logger.Info("LUIS")
+	l2a.params.Logger.Info("LUIS at upsertSvc")
 
 	// if the service is local only and we are not on the node, then let's not
 	// participate in the leader election
@@ -377,7 +377,7 @@ func (l2a *L2Announcer) upsertSvc(svc *slim_corev1.Service) error {
 			releaseLease = true
 		}
 		if !ok {
-			l2a.params.Logger.Info("LUIS this host does not have the locals")
+			l2a.params.Logger.Info("LUIS this host does --not-- have the locals")
 			releaseLease = true
 		}
 
@@ -863,13 +863,13 @@ func (l2a *L2Announcer) checkHealthStatus(port int32) (bool, error) {
 	// LUIS
 	// Perform the HTTP GET request.
 	var (
-		resp *http.Response
+		resp    *http.Response
 		waitErr error
 	)
-	err := WaitFor(60*time.Second, 1*time.Second, func () (bool, error) {
+	err := WaitFor(60*time.Second, 1*time.Second, func() (bool, error) {
 		resp, waitErr = http.Get(fmt.Sprintf("http://localhost:%d", port))
 		if waitErr != nil {
-			l2a.params.Logger.Error(fmt.Sprintf("failed to make HTTP request: %w", waitErr))
+			l2a.params.Logger.Warn(fmt.Sprintf("failed to make HTTP request: %w", waitErr))
 			return true, nil
 		}
 
@@ -1059,7 +1059,44 @@ func (l2a *L2Announcer) upsertLocalNode(ctx context.Context, localNode *v2.Ciliu
 	return errs
 }
 
+// LUIS
 func (l2a *L2Announcer) processLeaderEvent(event leaderElectionEvent) error {
+
+	l2a.params.Logger.Info("LUIS at processLeaderEvent")
+	svc := event.selectedService.svc
+	key := serviceKey(svc)
+
+	// if the service is local only and we are not on the node, then let's not
+	// participate in the leader election
+	if svc.Spec.ExternalTrafficPolicy ==
+		slim_corev1.ServiceExternalTrafficPolicy(lb.SVCTrafficPolicyLocal) {
+
+		releaseLease := false
+
+		// Get port number
+		port := svc.Spec.HealthCheckNodePort
+		if port <= 0 {
+			l2a.params.Logger.Error("LUIS HealthCheckNodePort is zero")
+			releaseLease = true
+		}
+
+		// Determine if we should be announcing for this service
+		ok, err := l2a.checkHealthStatus(port)
+		if err != nil {
+			l2a.params.Logger.Error(fmt.Sprintf("LUIS unable to check health of service: %v", err))
+			releaseLease = true
+		}
+		if !ok {
+			l2a.params.Logger.Info("LUIS this host does --not-- have the locals")
+			releaseLease = true
+		}
+
+		if releaseLease {
+			return l2a.delSvc(key)
+		}
+		l2a.params.Logger.Info("LUIS this host --DOES-- have the locals")
+	}
+
 	event.selectedService.currentlyLeader = event.typ == leaderElectionLeading
 	err := l2a.recalculateL2EntriesTableEntries(event.selectedService)
 	if err != nil {
