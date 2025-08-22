@@ -29,6 +29,7 @@ import (
 
 	daemon_k8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/datapath/tables"
+	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/k8s"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	cilium_api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
@@ -78,6 +79,7 @@ type l2AnnouncerParams struct {
 	Devices              statedb.Table[*tables.Device]
 	StateDB              *statedb.DB
 	JobGroup             job.Group
+	EndpointManager      endpointmanager.EndpointManager
 }
 
 // L2Announcer takes all L2 announcement policies and filters down to those that match the labels of the local node. It
@@ -98,6 +100,9 @@ type L2Announcer struct {
 
 	// selectedPolicies matching the current node.
 	selectedPolicies map[resource.Key]*selectedPolicy
+
+	// Map to track local endpoints by service name
+	localEndpoints map[lb.ServiceName]int
 	// Services which are selected by one or more policies for which we thus want to participate in leader election.
 	// Indexed by service key.
 	selectedServices map[resource.Key]*selectedService
@@ -114,6 +119,12 @@ func NewL2Announcer(params l2AnnouncerParams) *L2Announcer {
 		selectedPolicies:  make(map[resource.Key]*selectedPolicy),
 		leaderChannel:     make(chan leaderElectionEvent, leaderElectionBufferSize),
 		devicesUpdatedSig: make(chan struct{}, 1),
+		localEndpoints:    make(map[lb.ServiceName]int),
+	}
+
+	// Subscribe to endpoint events
+	if params.EndpointManager != nil {
+		params.EndpointManager.Subscribe(announcer)
 	}
 
 	// Can't operate or GC if client set is disabled
@@ -356,35 +367,13 @@ func (l2a *L2Announcer) upsertSvc(svc *slim_corev1.Service) error {
 
 	l2a.params.Logger.Info("LUIS at upsertSvc")
 
-	// if the service is local only and we are not on the node, then let's not
-	// participate in the leader election
-	if svc.Spec.ExternalTrafficPolicy ==
-		slim_corev1.ServiceExternalTrafficPolicy(lb.SVCTrafficPolicyLocal) {
-
-		releaseLease := false
-
-		// Get port number
-		port := svc.Spec.HealthCheckNodePort
-		if port <= 0 {
-			l2a.params.Logger.Error("LUIS HealthCheckNodePort is zero")
-			releaseLease = true
-		}
-
-		// Determine if we should be announcing for this service
-		ok, err := l2a.checkHealthStatus(port)
-		if err != nil {
-			l2a.params.Logger.Error(fmt.Sprintf("LUIS unable to check health of service: %v", err))
-			releaseLease = true
-		}
-		if !ok {
-			l2a.params.Logger.Info("LUIS this host does --not-- have the locals")
-			releaseLease = true
-		}
-
-		if releaseLease {
-			return l2a.delSvc(key)
-		}
-		l2a.params.Logger.Info("LUIS this host DOES have the locals")
+	// For Local LoadBalancer services, validate HealthCheckNodePort
+	if svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal &&
+		svc.Spec.Type == slim_corev1.ServiceTypeLoadBalancer &&
+		svc.Spec.HealthCheckNodePort <= 0 {
+		l2a.params.Logger.Error("LoadBalancer service with externalTrafficPolicy=Local requires HealthCheckNodePort",
+			"service", fmt.Sprintf("%s/%s", svc.Namespace, svc.Name))
+		return l2a.delSvc(key)
 	}
 
 	// Ignore services managed by an unsupported load balancer class.
@@ -397,6 +386,15 @@ func (l2a *L2Announcer) upsertSvc(svc *slim_corev1.Service) error {
 	if found {
 		// Update service object, labels or IPs may have changed
 		ss.svc = svc
+
+		// For externalTrafficPolicy=Local services in 'LoadBalancer' type, validate HealthCheckNodePort
+		if svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal &&
+			svc.Spec.Type == slim_corev1.ServiceTypeLoadBalancer &&
+			svc.Spec.HealthCheckNodePort <= 0 {
+			l2a.params.Logger.Error("LoadBalancer service with externalTrafficPolicy=Local requires HealthCheckNodePort",
+				"service", fmt.Sprintf("%s/%s", svc.Namespace, svc.Name))
+			return l2a.delSvc(key)
+		}
 
 		// Since labels may have changed, remove all matching policies, re-match against all known policies.
 		ss.byPolicies = nil
@@ -416,6 +414,32 @@ func (l2a *L2Announcer) upsertSvc(svc *slim_corev1.Service) error {
 			// It also stops any lease subscription and reconciles the output table.
 			l2a.gcOrphanedService(ss)
 			return nil
+		}
+
+		// Update the service state
+		ss.svc = svc
+		isLocal := svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal
+		if isLocal != ss.externalTrafficPolicyLocal {
+			// ExternalTrafficPolicy changed
+			ss.externalTrafficPolicyLocal = isLocal
+			if isLocal {
+				// Changed to Local - validate endpoints before starting leader election
+				svcName := lb.NewServiceName(svc.Namespace, svc.Name)
+				if l2a.HasLocalEndpoint(svc) {
+					l2a.params.Logger.Info("Service changed to externalTrafficPolicy=Local and has local endpoints, starting leader election",
+						"service", svcName)
+					ss.startLeaderElection(l2a.scopedGroup)
+				} else {
+					l2a.params.Logger.Info("Service changed to externalTrafficPolicy=Local but has no local endpoints, stopping leader election",
+						"service", svcName)
+					ss.stop()
+				}
+			} else {
+				// Changed from Local to Cluster - always participate in leader election
+				l2a.params.Logger.Info("Service changed to externalTrafficPolicy=Cluster, starting leader election",
+					"service", fmt.Sprintf("%s/%s", svc.Namespace, svc.Name))
+				ss.startLeaderElection(l2a.scopedGroup)
+			}
 		}
 
 		// Since IPs may have changed, re-calculate its entries in the output table, if we are leader
@@ -441,6 +465,9 @@ func (l2a *L2Announcer) upsertSvc(svc *slim_corev1.Service) error {
 
 	// Add the services to list of selected services if at least 1 policy matches it.
 	if len(matchingPolicies) >= 1 {
+		// Get service name for endpoint matching
+		// svcName := lb.NewServiceName(svc.Namespace, svc.Name)
+
 		l2a.addSelectedService(svc, matchingPolicies)
 	}
 
@@ -846,6 +873,7 @@ func WaitFor(timeout time.Duration, period time.Duration, f func() (bool, error)
 	return nil
 }
 
+/*
 // HealthCheckResponse defines the structure of the JSON response from the health check endpoint.
 // Using a struct makes it easy and safe to parse the JSON.
 type HealthCheckResponse struct {
@@ -909,27 +937,33 @@ func (l2a *L2Announcer) checkHealthStatus(port int32) (bool, error) {
 	// If we reach here, it means localEndpoints was 0 or less.
 	return false, fmt.Errorf("service is unhealthy: localEndpoints is %d", healthData.LocalEndpoints)
 }
+*/
 
 func (l2a *L2Announcer) addSelectedService(svc *slim_corev1.Service, byPolicies []resource.Key) {
 	leaseDuration, renewDeadline, retryPeriod := l2a.leaseTimings()
+	name := lb.NewServiceName(svc.Namespace, svc.Name)
+	isLocal := svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal
 	ss := &selectedService{
-		svc:           svc,
-		byPolicies:    byPolicies,
-		lock:          l2a.newLeaseLock(svc),
-		done:          make(chan struct{}),
-		leaderChannel: l2a.leaderChannel,
-		leaseDuration: leaseDuration,
-		renewDeadline: renewDeadline,
-		retryPeriod:   retryPeriod,
+		svc:                        svc,
+		byPolicies:                 byPolicies,
+		name:                       name,
+		externalTrafficPolicyLocal: isLocal,
+		lock:                       l2a.newLeaseLock(svc),
+		done:                       make(chan struct{}),
+		leaderChannel:              l2a.leaderChannel,
+		leaseDuration:              leaseDuration,
+		renewDeadline:              renewDeadline,
+		retryPeriod:                retryPeriod,
 	}
 
 	l2a.selectedServices[serviceKey(svc)] = ss
 
-	// kick off leader election job
-	l2a.scopedGroup.Add(job.OneShot(
-		shortener.ShortenHiveJobName(fmt.Sprintf("leader-election-%s-%s", svc.Namespace, svc.Name)),
-		ss.serviceLeaderElection),
-	)
+	// Always participate in leader election - endpoint validation happens when becoming leader
+	l2a.params.Logger.Info("Starting leader election for service",
+		"service", name,
+		"externalTrafficPolicy", svc.Spec.ExternalTrafficPolicy,
+		"hasLocalEndpoints", l2a.HasLocalEndpoint(ss.svc))
+	ss.startLeaderElection(l2a.scopedGroup)
 }
 
 func (l2a *L2Announcer) leaseNamespace() string {
@@ -1061,48 +1095,44 @@ func (l2a *L2Announcer) upsertLocalNode(ctx context.Context, localNode *v2.Ciliu
 
 // LUIS
 func (l2a *L2Announcer) processLeaderEvent(event leaderElectionEvent) error {
+	if event.selectedService == nil {
+		return fmt.Errorf("received leader event with nil service")
+	}
+	ss := event.selectedService
 
-	l2a.params.Logger.Info("LUIS at processLeaderEvent")
-	svc := event.selectedService.svc
-	key := serviceKey(svc)
-
-	// if the service is local only and we are not on the node, then let's not
-	// participate in the leader election
-	if svc.Spec.ExternalTrafficPolicy ==
-		slim_corev1.ServiceExternalTrafficPolicy(lb.SVCTrafficPolicyLocal) {
-
-		releaseLease := false
-
-		// Get port number
-		port := svc.Spec.HealthCheckNodePort
-		if port <= 0 {
-			l2a.params.Logger.Error("LUIS HealthCheckNodePort is zero")
-			releaseLease = true
+	switch event.typ {
+	case leaderElectionLeading:
+		// Becoming leader - for Local services, verify we have endpoints
+		if ss.externalTrafficPolicyLocal {
+			if !l2a.HasLocalEndpoint(ss.svc) {
+				l2a.params.Logger.Info("Won leadership but have no local endpoints, releasing",
+					"service", ss.name)
+				ss.stop()
+				return l2a.recalculateL2EntriesTableEntries(ss)
+			}
+			l2a.params.Logger.Info("Became leader with local endpoints",
+				"service", ss.name,
+				"endpoints", l2a.localEndpoints[ss.name])
+		} else {
+			l2a.params.Logger.Info("Became leader for Cluster service",
+				"service", ss.name)
 		}
+		ss.currentlyLeader = true
 
-		// Determine if we should be announcing for this service
-		ok, err := l2a.checkHealthStatus(port)
-		if err != nil {
-			l2a.params.Logger.Error(fmt.Sprintf("LUIS unable to check health of service: %v", err))
-			releaseLease = true
-		}
-		if !ok {
-			l2a.params.Logger.Info("LUIS this host does --not-- have the locals")
-			releaseLease = true
-		}
+	case leaderElectionStoppedLeading:
+		wasLeader := ss.currentlyLeader
+		ss.currentlyLeader = false
+		l2a.params.Logger.Info("Stopped being leader",
+			"service", ss.name,
+			"wasLeader", wasLeader)
 
-		if releaseLease {
-			return l2a.delSvc(key)
-		}
-		l2a.params.Logger.Info("LUIS this host --DOES-- have the locals")
+	default:
+		return fmt.Errorf("unknown leader election event type: %v", event.typ)
 	}
 
-	event.selectedService.currentlyLeader = event.typ == leaderElectionLeading
-	err := l2a.recalculateL2EntriesTableEntries(event.selectedService)
-	if err != nil {
-		return fmt.Errorf("recalculateNeighborProxyTableEntries: %w", err)
+	if err := l2a.recalculateL2EntriesTableEntries(ss); err != nil {
+		return fmt.Errorf("failed to recalculate L2 entries: %w", err)
 	}
-
 	return nil
 }
 
@@ -1289,6 +1319,10 @@ type selectedService struct {
 	svc *slim_corev1.Service
 	// The policies which select this service.
 	byPolicies []resource.Key
+	// Service name for lookup
+	name lb.ServiceName
+	// Track if this service has externalTrafficPolicy: Local
+	externalTrafficPolicyLocal bool
 
 	// lease parameters
 	leaseDuration time.Duration
@@ -1344,11 +1378,23 @@ func (ss *selectedService) serviceLeaderElection(ctx context.Context, health cel
 	}
 }
 
+// stop cancels the leader election goroutine for this service
 func (ss *selectedService) stop() {
 	if ss.cancel != nil {
 		ss.cancel()
 		<-ss.done
 		ss.currentlyLeader = false
+	}
+}
+
+// startLeaderElection starts the leader election goroutine for this service if stopped
+func (ss *selectedService) startLeaderElection(group job.ScopedGroup) {
+	if ss.cancel == nil {
+		// kick off leader election job
+		group.Add(job.OneShot(
+			shortener.ShortenHiveJobName(fmt.Sprintf("leader-election-%s-%s", ss.svc.Namespace, ss.svc.Name)),
+			ss.serviceLeaderElection),
+		)
 	}
 }
 
