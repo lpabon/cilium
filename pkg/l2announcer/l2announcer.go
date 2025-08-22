@@ -1384,6 +1384,7 @@ func (ss *selectedService) stop() {
 		ss.cancel()
 		<-ss.done
 		ss.currentlyLeader = false
+		ss.cancel = nil
 	}
 }
 
