@@ -1105,12 +1105,11 @@ func (l2a *L2Announcer) processLeaderEvent(event leaderElectionEvent) error {
 		// Becoming leader - for Local services, verify we have endpoints
 		if ss.externalTrafficPolicyLocal {
 			if !l2a.HasLocalEndpoint(ss.svc) {
-				l2a.params.Logger.Info("Won leadership but have no local endpoints, releasing",
+				l2a.params.Logger.Info("LUIS Won leadership but have no local endpoints, releasing",
 					"service", ss.name)
-				ss.stop()
-				return l2a.recalculateL2EntriesTableEntries(ss)
+				return l2a.delSvc(serviceKey(ss.svc))
 			}
-			l2a.params.Logger.Info("Became leader with local endpoints",
+			l2a.params.Logger.Info("LUIS Became leader with local endpoints",
 				"service", ss.name,
 				"endpoints", l2a.localEndpoints[ss.name])
 		} else {

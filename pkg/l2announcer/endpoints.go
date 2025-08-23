@@ -116,57 +116,18 @@ func (l2a *L2Announcer) checkHealthStatus(port int32) (bool, error) {
 
 // EndpointCreated is called when a new endpoint is created
 func (l2a *L2Announcer) EndpointCreated(ep *endpoint.Endpoint) {
-	// Get service name from namespace and pod
-	ns := ep.GetK8sNamespace()
-	podName := ep.GetK8sPodName()
-	if ns == "" || podName == "" {
-		return
-	}
-
-	// Convert to LoadBalancer ServiceName type
-	svcName := lb.NewServiceName(ns, podName)
-
-	// Increment the count of local endpoints for this service
-	l2a.localEndpoints[svcName]++
-
-	l2a.params.Logger.Info("LUIS EndpointCreated",
-		"service", svcName.String(),
-		"endpointCount", l2a.localEndpoints[svcName])
-
-	// Check if we should update leader election based on endpoint count
-	l2a.checkEndpointCount(svcName)
+	l2a.checkEndpointCount()
 }
 
 // EndpointDeleted is called when an endpoint is deleted
 func (l2a *L2Announcer) EndpointDeleted(ep *endpoint.Endpoint, conf endpoint.DeleteConfig) {
-	// Get service name from namespace and pod
-	ns := ep.GetK8sNamespace()
-	podName := ep.GetK8sPodName()
-	if ns == "" || podName == "" {
-		return
-	}
-
-	// Convert to LoadBalancer ServiceName type
-	svcName := lb.NewServiceName(ns, podName)
-	l2a.checkEndpointCount(svcName)
-
-	// Decrement the count of local endpoints for this service
-	if count := l2a.localEndpoints[svcName]; count > 0 {
-		l2a.localEndpoints[svcName] = count - 1
-
-		l2a.params.Logger.Info("LUIS EndpointDeleted",
-			"service", svcName.String(),
-			"endpointCount", l2a.localEndpoints[svcName])
-
-	}
-	// Check if we should update leader election based on endpoint count
-	l2a.checkEndpointCount(svcName)
+	l2a.checkEndpointCount()
 }
 
 // EndpointRestored is called when an endpoint is restored
 func (l2a *L2Announcer) EndpointRestored(ep *endpoint.Endpoint) {
 	// Handle restored endpoints similar to created ones
-	l2a.EndpointCreated(ep)
+	l2a.checkEndpointCount()
 }
 
 // HasLocalEndpoint checks if a service has at least one local endpoint
@@ -207,50 +168,28 @@ func (l2a *L2Announcer) HasLocalEndpoint(svc *slim_corev1.Service) bool {
 }
 
 // checkEndpointCount verifies if there are any local endpoints for a service
-func (l2a *L2Announcer) checkEndpointCount(svcName lb.ServiceName) {
+func (l2a *L2Announcer) checkEndpointCount() error {
 	// Get selected services for this service name
 	for _, ss := range l2a.selectedServices {
-		if ss.name == svcName {
-			// For services with externalTrafficPolicy=Local, if we're the leader
-			// we need to verify we still have endpoints
-			if ss.externalTrafficPolicyLocal && ss.currentlyLeader {
-				hasLocalEndpoints := l2a.HasLocalEndpoint(ss.svc)
+		if ss.externalTrafficPolicyLocal {
+			// For services with externalTrafficPolicy=Local, if we're not the leader
+			// we need to verify if we have endpoints to potentially start leading
+			hasLocalEndpoints := l2a.HasLocalEndpoint(ss.svc)
+			svcName := ss.svc.Name
 
-				// Log the current state for observability
-				l2a.params.Logger.Info("LUIS Checking local endpoints for leader",
-					"service", svcName,
-					"hasLocalEndpoints", hasLocalEndpoints)
+			// Log the current state for observability
+			l2a.params.Logger.Info("LUIS Checking local endpoints",
+				"service", svcName,
+				"hasLocalEndpoints", hasLocalEndpoints)
 
-				if !hasLocalEndpoints {
-					// No local endpoints, must release leadership
-					l2a.params.Logger.Info("LUIS Leader lost all local endpoints, releasing leadership",
-						"service", svcName)
-					ss.stop()
-
-					// Clear any L2 announcements since we're no longer leader
-					if err := l2a.recalculateL2EntriesTableEntries(ss); err != nil {
-						l2a.params.Logger.Error("LUIS Failed to recalculate L2 entries",
-							"service", svcName,
-							"error", err)
-					}
-				}
-			} else if ss.externalTrafficPolicyLocal && !ss.currentlyLeader {
-				// For services with externalTrafficPolicy=Local, if we're not the leader
-				// we need to verify if we have endpoints to potentially start leading
-				hasLocalEndpoints := l2a.HasLocalEndpoint(ss.svc)
-
-				// Log the current state for observability
-				l2a.params.Logger.Info("LUIS Checking local endpoints for non-leader",
-					"service", svcName,
-					"hasLocalEndpoints", hasLocalEndpoints)
-
-				if hasLocalEndpoints {
-					// We have local endpoints, can try to acquire leadership
-					l2a.params.Logger.Info("LUIS Non-leader found local endpoints, attempting to acquire leadership",
-						"service", svcName)
-					ss.startLeaderElection(l2a.scopedGroup)
-				}
+			if ss.currentlyLeader && !hasLocalEndpoints {
+				// No local endpoints, must release leadership
+				l2a.params.Logger.Info("LUIS Leader lost all local endpoints, releasing leadership",
+					"service", svcName)
+				return l2a.delSvc(serviceKey(ss.svc))
 			}
 		}
 	}
+
+	return nil
 }
