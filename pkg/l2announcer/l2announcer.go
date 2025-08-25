@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Cilium
 
+/*
+
+l2announcer start:
+- If the service has Local, and we have local endpoints, start leader election
+- Endpoint events:
+  - Created/Deleted:
+    - If the service has Local, and we have local endpoints, start leader election
+	- else if we have no local endpoints and we are the leader, stop leader election
+*/
+
 package l2announcer
 
 import (
@@ -442,6 +452,13 @@ func (l2a *L2Announcer) upsertSvc(svc *slim_corev1.Service) error {
 			}
 		}
 
+		// Check if the service has local endpoints
+		if svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal {
+			if !l2a.HasLocalEndpoint(svc) {
+				return nil
+			}
+		}
+
 		// Since IPs may have changed, re-calculate its entries in the output table, if we are leader
 		err := l2a.recalculateL2EntriesTableEntries(ss)
 		if err != nil {
@@ -677,6 +694,14 @@ func (l2a *L2Announcer) upsertPolicy(ctx context.Context, policy *cilium_api_v2a
 			continue
 		}
 
+		// Check if the service has local endpoints
+		if svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal {
+			if !l2a.HasLocalEndpoint(svc) {
+				continue
+			}
+		}
+
+		// LUIS - add to leader election
 		l2a.addSelectedService(svc, []resource.Key{key})
 	}
 
@@ -959,7 +984,7 @@ func (l2a *L2Announcer) addSelectedService(svc *slim_corev1.Service, byPolicies 
 	l2a.selectedServices[serviceKey(svc)] = ss
 
 	// Always participate in leader election - endpoint validation happens when becoming leader
-	l2a.params.Logger.Info("Starting leader election for service",
+	l2a.params.Logger.Info("LUIS Starting leader election for service",
 		"service", name,
 		"externalTrafficPolicy", svc.Spec.ExternalTrafficPolicy,
 		"hasLocalEndpoints", l2a.HasLocalEndpoint(ss.svc))

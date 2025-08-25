@@ -118,6 +118,16 @@ func (l2a *L2Announcer) checkHealthStatus(port int32) (bool, error) {
 func (l2a *L2Announcer) EndpointCreated(ep *endpoint.Endpoint) {
 	// Create leader
 	l2a.checkEndpointCount()
+
+	for _, svc := range l2a.svcStore.List() {
+		// Check if the service has local endpoints
+		if svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal {
+			if l2a.HasLocalEndpoint(svc) {
+				// Create leader
+				l2a.addSelectedService(svc, nil)
+			}
+		}
+	}
 }
 
 // EndpointDeleted is called when an endpoint is deleted
