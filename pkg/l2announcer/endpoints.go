@@ -116,18 +116,20 @@ func (l2a *L2Announcer) checkHealthStatus(port int32) (bool, error) {
 
 // EndpointCreated is called when a new endpoint is created
 func (l2a *L2Announcer) EndpointCreated(ep *endpoint.Endpoint) {
+	// Create leader
 	l2a.checkEndpointCount()
 }
 
 // EndpointDeleted is called when an endpoint is deleted
 func (l2a *L2Announcer) EndpointDeleted(ep *endpoint.Endpoint, conf endpoint.DeleteConfig) {
+	// delete leader
 	l2a.checkEndpointCount()
 }
 
 // EndpointRestored is called when an endpoint is restored
 func (l2a *L2Announcer) EndpointRestored(ep *endpoint.Endpoint) {
 	// Handle restored endpoints similar to created ones
-	l2a.checkEndpointCount()
+	l2a.EndpointCreated(ep)
 }
 
 // HasLocalEndpoint checks if a service has at least one local endpoint
@@ -146,21 +148,25 @@ func (l2a *L2Announcer) HasLocalEndpoint(svc *slim_corev1.Service) bool {
 		// Get port number
 		port := svc.Spec.HealthCheckNodePort
 		if port <= 0 {
-			l2a.params.Logger.Error("LUIS HealthCheckNodePort is zero")
+			l2a.params.Logger.Error("LUIS HealthCheckNodePort is zero",
+				"service", svcName.String())
 		}
 
 		// Determine if we should be announcing for this service
 		ok, err := l2a.checkHealthStatus(port)
 		if err != nil {
-			l2a.params.Logger.Error(fmt.Sprintf("LUIS unable to check health of service: %v", err))
+			l2a.params.Logger.Error(fmt.Sprintf("LUIS unable to check health of service: %v", err),
+				"service", svcName.String())
 			return false
 		}
 		if !ok {
-			l2a.params.Logger.Info("LUIS this host does --not-- have the locals")
+			l2a.params.Logger.Info("LUIS this host does --not-- have the locals",
+				"service", svcName.String())
 			return false
 		}
 
-		l2a.params.Logger.Info("LUIS this host --DOES-- have the locals")
+		l2a.params.Logger.Info("LUIS this host --DOES-- have the locals",
+			"service", svcName.String())
 		return true
 	}
 
@@ -190,6 +196,5 @@ func (l2a *L2Announcer) checkEndpointCount() error {
 			}
 		}
 	}
-
 	return nil
 }
