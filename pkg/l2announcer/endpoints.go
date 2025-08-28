@@ -116,24 +116,50 @@ func (l2a *L2Announcer) checkHealthStatus(port int32) (bool, error) {
 
 // EndpointCreated is called when a new endpoint is created
 func (l2a *L2Announcer) EndpointCreated(ep *endpoint.Endpoint) {
-	// Create leader
-	l2a.checkEndpointCount()
+	// Log the current state for observability
+	l2a.params.Logger.Info("LUIS EndpointCreated Checking local endpoints")
 
 	for _, svc := range l2a.svcStore.List() {
+		l2a.params.Logger.Info("LUIS EndpointCreated checking service",
+			"service", lb.NewServiceName(svc.Namespace, svc.Name))
 		// Check if the service has local endpoints
-		if svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal {
-			if l2a.HasLocalEndpoint(svc) {
-				// Create leader
-				l2a.addSelectedService(svc, nil)
-			}
+		if (svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal) &&
+			l2a.HasLocalEndpoint(svc) {
+			// Log the current state for observability
+			l2a.params.Logger.Info("LUIS EndpointCreated adding service to leader election",
+				"service", lb.NewServiceName(svc.Namespace, svc.Name))
+			// Create leader
+			l2a.addSelectedService(svc, nil)
 		}
 	}
 }
 
 // EndpointDeleted is called when an endpoint is deleted
 func (l2a *L2Announcer) EndpointDeleted(ep *endpoint.Endpoint, conf endpoint.DeleteConfig) {
-	// delete leader
-	l2a.checkEndpointCount()
+	// Get selected services for this service name
+	for _, ss := range l2a.selectedServices {
+		if ss.externalTrafficPolicyLocal {
+			// For services with externalTrafficPolicy=Local, if we're not the leader
+			// we need to verify if we have endpoints to potentially start leading
+			hasLocalEndpoints := l2a.HasLocalEndpoint(ss.svc)
+			svcName := ss.svc.Name
+
+			// Log the current state for observability
+			l2a.params.Logger.Info("LUIS Checking local endpoints",
+				"service", svcName,
+				"hasLocalEndpoints", hasLocalEndpoints)
+
+			if ss.currentlyLeader && !hasLocalEndpoints {
+				// No local endpoints, must release leadership
+				l2a.params.Logger.Info("LUIS Leader lost all local endpoints, releasing leadership",
+					"service", svcName)
+				if err := l2a.delSvc(serviceKey(ss.svc)); err != nil {
+					l2a.params.Logger.Error(fmt.Sprintf("LUIS Failed to delete service: %v", err),
+						"service", svcName)
+				}
+			}
+		}
+	}
 }
 
 // EndpointRestored is called when an endpoint is restored
@@ -181,30 +207,4 @@ func (l2a *L2Announcer) HasLocalEndpoint(svc *slim_corev1.Service) bool {
 	}
 
 	return false
-}
-
-// checkEndpointCount verifies if there are any local endpoints for a service
-func (l2a *L2Announcer) checkEndpointCount() error {
-	// Get selected services for this service name
-	for _, ss := range l2a.selectedServices {
-		if ss.externalTrafficPolicyLocal {
-			// For services with externalTrafficPolicy=Local, if we're not the leader
-			// we need to verify if we have endpoints to potentially start leading
-			hasLocalEndpoints := l2a.HasLocalEndpoint(ss.svc)
-			svcName := ss.svc.Name
-
-			// Log the current state for observability
-			l2a.params.Logger.Info("LUIS Checking local endpoints",
-				"service", svcName,
-				"hasLocalEndpoints", hasLocalEndpoints)
-
-			if ss.currentlyLeader && !hasLocalEndpoints {
-				// No local endpoints, must release leadership
-				l2a.params.Logger.Info("LUIS Leader lost all local endpoints, releasing leadership",
-					"service", svcName)
-				return l2a.delSvc(serviceKey(ss.svc))
-			}
-		}
-	}
-	return nil
 }

@@ -1146,7 +1146,7 @@ func (l2a *L2Announcer) processLeaderEvent(event leaderElectionEvent) error {
 	case leaderElectionStoppedLeading:
 		wasLeader := ss.currentlyLeader
 		ss.currentlyLeader = false
-		l2a.params.Logger.Info("Stopped being leader",
+		l2a.params.Logger.Info("XXX Stopped being leader",
 			"service", ss.name,
 			"wasLeader", wasLeader)
 
