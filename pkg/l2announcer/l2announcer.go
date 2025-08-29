@@ -614,6 +614,14 @@ func (l2a *L2Announcer) upsertPolicy(ctx context.Context, policy *cilium_api_v2a
 			continue
 		}
 
+		// Do not participate in leader election for the service that
+		// has no local endpoints
+		if svc.Spec.ExternalTrafficPolicy ==
+			slim_corev1.ServiceExternalTrafficPolicyLocal &&
+			!l2a.HasLocalEndpoint(svc) {
+			continue
+		}
+
 		l2a.addSelectedService(svc, []resource.Key{key})
 	}
 
@@ -789,6 +797,7 @@ func (l2a *L2Announcer) leaseTimings() (leaseDuration, renewDeadline, retryPerio
 func (l2a *L2Announcer) addSelectedService(svc *slim_corev1.Service, byPolicies []resource.Key) {
 	leaseDuration, renewDeadline, retryPeriod := l2a.leaseTimings()
 	ss := &selectedService{
+		logger:        l2a.params.Logger,
 		svc:           svc,
 		byPolicies:    byPolicies,
 		lock:          l2a.newLeaseLock(svc),
@@ -1124,6 +1133,7 @@ func svcAndMetaLabels(svc *slim_corev1.Service) labels.Set {
 }
 
 type selectedService struct {
+	logger *slog.Logger
 	// The last known version of the service
 	svc *slim_corev1.Service
 	// The policies which select this service.
@@ -1166,12 +1176,20 @@ func (ss *selectedService) serviceLeaderElection(ctx context.Context, health cel
 
 				Callbacks: leaderelection.LeaderCallbacks{
 					OnStartedLeading: func(ctx context.Context) {
+						ss.logger.Info("LUIS leading for service",
+							logfields.ServiceName, ss.svc.Name,
+							logfields.ServiceNamespace, ss.svc.Namespace,
+						)
 						ss.leaderChannel <- leaderElectionEvent{
 							typ:             leaderElectionLeading,
 							selectedService: ss,
 						}
 					},
 					OnStoppedLeading: func() {
+						ss.logger.Info("LUIS Stopped leading for service",
+							logfields.ServiceName, ss.svc.Name,
+							logfields.ServiceNamespace, ss.svc.Namespace,
+						)
 						ss.leaderChannel <- leaderElectionEvent{
 							typ:             leaderElectionStoppedLeading,
 							selectedService: ss,

@@ -95,7 +95,6 @@ func (l2a *L2Announcer) checkHealthStatus(port int32) (bool, error) {
 	err := WaitFor(60*time.Second, 1*time.Second, func() (bool, error) {
 		resp, waitErr = http.Get(fmt.Sprintf("http://localhost:%d", port))
 		if waitErr != nil {
-			l2a.params.Logger.Warn(fmt.Sprintf("failed to make HTTP request: %w", waitErr))
 			return true, nil
 		}
 
@@ -144,24 +143,35 @@ func (l2a *L2Announcer) EndpointCreated(ep *endpoint.Endpoint) {
 	l2a.params.Logger.Info("LUIS EndpointCreated Checking local endpoints")
 
 	for _, svc := range l2a.svcStore.List() {
+		key := serviceKey(svc)
+		if _, found := l2a.selectedServices[key]; found {
+			// Already selected, nothing to do
+			l2a.params.Logger.Info("LUIS EndpointCreated service already selected, continuing",
+				"service", lb.NewServiceName(svc.Namespace, svc.Name))
+			continue
+		}
+
 		l2a.params.Logger.Info("LUIS EndpointCreated checking service",
 			"service", lb.NewServiceName(svc.Namespace, svc.Name))
-		// Check if the service has local endpoints
-		if svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal &&
-			l2a.HasLocalEndpoint(svc) {
-			// Log the current state for observability
-			l2a.params.Logger.Info("LUIS EndpointCreated adding service to leader election",
+
+		if err := l2a.upsertSvc(svc); err != nil {
+			l2a.params.Logger.Error(fmt.Sprintf("LUIS EndpointCreated Failed to upsert service: %v", err),
 				"service", lb.NewServiceName(svc.Namespace, svc.Name))
-			// Create leader
-			l2a.addSelectedService(svc, nil)
+		} else {
+			l2a.params.Logger.Info("LUIS EndpointCreated upserted service",
+				"service", lb.NewServiceName(svc.Namespace, svc.Name))
 		}
 	}
 }
 
 // EndpointDeleted is called when an endpoint is deleted
 func (l2a *L2Announcer) EndpointDeleted(ep *endpoint.Endpoint, conf endpoint.DeleteConfig) {
+	l2a.params.Logger.Info("LUIS EndpointDeleted")
 	// Get selected services for this service name
 	for _, ss := range l2a.selectedServices {
+		l2a.params.Logger.Info("LUIS EndpointDeleted",
+			"service",
+			lb.NewServiceName(ss.svc.Namespace, ss.svc.Name))
 		if ss.svc.Spec.ExternalTrafficPolicy ==
 			slim_corev1.ServiceExternalTrafficPolicyLocal {
 			// For services with externalTrafficPolicy=Local, if we're not the leader
@@ -172,7 +182,8 @@ func (l2a *L2Announcer) EndpointDeleted(ep *endpoint.Endpoint, conf endpoint.Del
 			// Log the current state for observability
 			l2a.params.Logger.Info("LUIS Checking local endpoints",
 				"service", svcName,
-				"hasLocalEndpoints", hasLocalEndpoints)
+				"hasLocalEndpoints", hasLocalEndpoints,
+				"currentlyLeader", ss.currentlyLeader)
 
 			if ss.currentlyLeader && !hasLocalEndpoints {
 				// No local endpoints, must release leadership
@@ -182,6 +193,8 @@ func (l2a *L2Announcer) EndpointDeleted(ep *endpoint.Endpoint, conf endpoint.Del
 					l2a.params.Logger.Error(fmt.Sprintf("LUIS Failed to delete service: %v", err),
 						"service", svcName)
 				}
+				l2a.params.Logger.Info("LUIS released leadership",
+					"service", svcName)
 			}
 		}
 	}
