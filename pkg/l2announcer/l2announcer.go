@@ -27,6 +27,7 @@ import (
 
 	daemon_k8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/datapath/tables"
+	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/k8s"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	cilium_api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
@@ -75,6 +76,7 @@ type l2AnnouncerParams struct {
 	Devices              statedb.Table[*tables.Device]
 	StateDB              *statedb.DB
 	JobGroup             job.Group
+	EndpointManager      endpointmanager.EndpointManager
 }
 
 // L2Announcer takes all L2 announcement policies and filters down to those that match the labels of the local node. It
@@ -111,6 +113,11 @@ func NewL2Announcer(params l2AnnouncerParams) *L2Announcer {
 		selectedPolicies:  make(map[resource.Key]*selectedPolicy),
 		leaderChannel:     make(chan leaderElectionEvent, leaderElectionBufferSize),
 		devicesUpdatedSig: make(chan struct{}, 1),
+	}
+
+	// Subscribe to endpoint events
+	if params.EndpointManager != nil {
+		params.EndpointManager.Subscribe(announcer)
 	}
 
 	// Can't operate or GC if client set is disabled
@@ -365,6 +372,13 @@ func (l2a *L2Announcer) upsertSvc(svc *slim_corev1.Service) error {
 			return fmt.Errorf("recalculateL2EntriesTableEntries: %w", err)
 		}
 
+		// LUIS
+		if svc.Spec.ExternalTrafficPolicy ==
+			slim_corev1.ServiceExternalTrafficPolicyLocal &&
+			!l2a.HasLocalEndpoint(svc) {
+			return l2a.delSvc(key)
+		}
+
 		return nil
 	}
 
@@ -382,6 +396,15 @@ func (l2a *L2Announcer) upsertSvc(svc *slim_corev1.Service) error {
 
 	// Add the services to list of selected services if at least 1 policy matches it.
 	if len(matchingPolicies) >= 1 {
+
+		// Do not participate in leader election for the service that
+		// has no local endpoints
+		if svc.Spec.ExternalTrafficPolicy ==
+			slim_corev1.ServiceExternalTrafficPolicyLocal &&
+			!l2a.HasLocalEndpoint(svc) {
+			return nil
+		}
+
 		l2a.addSelectedService(svc, matchingPolicies)
 	}
 
