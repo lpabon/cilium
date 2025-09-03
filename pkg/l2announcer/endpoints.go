@@ -173,7 +173,8 @@ func (l2a *L2Announcer) EndpointDeleted(ep *endpoint.Endpoint, conf endpoint.Del
 			"service",
 			lb.NewServiceName(ss.svc.Namespace, ss.svc.Name))
 		if ss.svc.Spec.ExternalTrafficPolicy ==
-			slim_corev1.ServiceExternalTrafficPolicyLocal {
+			slim_corev1.ServiceExternalTrafficPolicyLocal &&
+			ss.currentlyLeader {
 			// For services with externalTrafficPolicy=Local, if we're not the leader
 			// we need to verify if we have endpoints to potentially start leading
 			hasLocalEndpoints := l2a.HasLocalEndpoint(ss.svc)
@@ -185,7 +186,7 @@ func (l2a *L2Announcer) EndpointDeleted(ep *endpoint.Endpoint, conf endpoint.Del
 				"hasLocalEndpoints", hasLocalEndpoints,
 				"currentlyLeader", ss.currentlyLeader)
 
-			if ss.currentlyLeader && !hasLocalEndpoints {
+			if !hasLocalEndpoints {
 				// No local endpoints, must release leadership
 				l2a.params.Logger.Info("LUIS Leader lost all local endpoints, releasing leadership",
 					"service", svcName)
