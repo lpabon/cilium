@@ -37,6 +37,7 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
 	slim_meta_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/k8s/utils"
+	lb "github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/shortener"
@@ -93,6 +94,7 @@ type L2Announcer struct {
 	scopedGroup job.ScopedGroup
 
 	leaderChannel     chan leaderElectionEvent
+	endpointEvents    chan endpointEvent
 	devicesUpdatedSig chan struct{}
 
 	// selectedPolicies matching the current node.
@@ -112,6 +114,7 @@ func NewL2Announcer(params l2AnnouncerParams) *L2Announcer {
 		selectedServices:  make(map[resource.Key]*selectedService),
 		selectedPolicies:  make(map[resource.Key]*selectedPolicy),
 		leaderChannel:     make(chan leaderElectionEvent, leaderElectionBufferSize),
+		endpointEvents:    make(chan endpointEvent, leaderElectionBufferSize),
 		devicesUpdatedSig: make(chan struct{}, 1),
 	}
 
@@ -181,6 +184,7 @@ func (l2a *L2Announcer) run(ctx context.Context, health cell.Health) error {
 		}
 	}
 
+	localNodeTimer := time.NewTicker(30 * time.Second)
 loop:
 	for {
 		select {
@@ -218,6 +222,22 @@ loop:
 
 			if err := l2a.processLocalNodeEvent(ctx, event); err != nil {
 				l2a.params.Logger.Warn("Error processing local node event",
+					logfields.Error, err,
+				)
+			}
+
+		case <-localNodeTimer.C:
+			if err := l2a.processEndpointEvent(endpointEvent{
+				typ: EndpointCreatedEvent,
+			}); err != nil {
+				l2a.params.Logger.Warn("Error processing endpoint event",
+					logfields.Error, err,
+				)
+			}
+
+		case event := <-l2a.endpointEvents:
+			if err := l2a.processEndpointEvent(event); err != nil {
+				l2a.params.Logger.Warn("Error processing endpoint event",
 					logfields.Error, err,
 				)
 			}
@@ -797,15 +817,16 @@ func (l2a *L2Announcer) leaseTimings() (leaseDuration, renewDeadline, retryPerio
 func (l2a *L2Announcer) addSelectedService(svc *slim_corev1.Service, byPolicies []resource.Key) {
 	leaseDuration, renewDeadline, retryPeriod := l2a.leaseTimings()
 	ss := &selectedService{
-		logger:        l2a.params.Logger,
-		svc:           svc,
-		byPolicies:    byPolicies,
-		lock:          l2a.newLeaseLock(svc),
-		done:          make(chan struct{}),
-		leaderChannel: l2a.leaderChannel,
-		leaseDuration: leaseDuration,
-		renewDeadline: renewDeadline,
-		retryPeriod:   retryPeriod,
+		logger:         l2a.params.Logger,
+		svc:            svc,
+		byPolicies:     byPolicies,
+		lock:           l2a.newLeaseLock(svc),
+		done:           make(chan struct{}),
+		leaderChannel:  l2a.leaderChannel,
+		endpointEvents: l2a.endpointEvents,
+		leaseDuration:  leaseDuration,
+		renewDeadline:  renewDeadline,
+		retryPeriod:    retryPeriod,
 	}
 
 	l2a.selectedServices[serviceKey(svc)] = ss
@@ -1148,6 +1169,7 @@ type selectedService struct {
 	lock            *resourcelock.LeaseLock
 	currentlyLeader bool
 	leaderChannel   chan leaderElectionEvent
+	endpointEvents  chan endpointEvent
 
 	// Leader election goroutine lifetime management
 	ctx    context.Context
@@ -1228,4 +1250,89 @@ type selectedPolicy struct {
 	// a cached list of network devices selected by this policy based on the regular expressions in the policy
 	// and the latest known list of devices.
 	selectedDevices []string
+}
+
+type endpointEventType int
+
+const (
+	EndpointCreatedEvent endpointEventType = iota
+	EndpointRestoredEvent
+	EndpointDeletedEvent
+)
+
+type endpointEvent struct {
+	typ endpointEventType
+}
+
+// processEndpointEvent is called when an endpoint is created, restored or deleted. It checks if the endpoint
+// belongs to a service we are announcing with ExternalTrafficPolicy=Local, and if so, triggers a recalculation
+// of the L2 entries for that service.
+func (l2a *L2Announcer) processEndpointEvent(event endpointEvent) error {
+
+	switch event.typ {
+	case EndpointCreatedEvent, EndpointRestoredEvent:
+
+		l2a.params.Logger.Info("LUIS EndpointCreated Event handler: Checking local endpoints")
+
+		for _, svc := range l2a.svcStore.List() {
+			key := serviceKey(svc)
+			if _, found := l2a.selectedServices[key]; found {
+				// Already selected, nothing to do
+				l2a.params.Logger.Info("LUIS EndpointCreated service already selected, continuing",
+					"service", lb.NewServiceName(svc.Namespace, svc.Name))
+				continue
+			}
+
+			l2a.params.Logger.Info("LUIS EndpointCreated checking service",
+				"service", lb.NewServiceName(svc.Namespace, svc.Name))
+
+			if err := l2a.upsertSvc(svc); err != nil {
+				l2a.params.Logger.Error(fmt.Sprintf("LUIS EndpointCreated Failed to upsert service: %v", err),
+					"service", lb.NewServiceName(svc.Namespace, svc.Name))
+			} else {
+				l2a.params.Logger.Info("LUIS EndpointCreated upserted service",
+					"service", lb.NewServiceName(svc.Namespace, svc.Name))
+			}
+		}
+
+	case EndpointDeletedEvent:
+		l2a.params.Logger.Info("LUIS EndpointDeleted Event handler: Checking local endpoints")
+		// Get selected services for this service name
+		for _, ss := range l2a.selectedServices {
+			l2a.params.Logger.Info("LUIS EndpointDeleted",
+				"service",
+				lb.NewServiceName(ss.svc.Namespace, ss.svc.Name))
+			if ss.svc.Spec.ExternalTrafficPolicy ==
+				slim_corev1.ServiceExternalTrafficPolicyLocal &&
+				ss.currentlyLeader {
+				// For services with externalTrafficPolicy=Local, if we're not the leader
+				// we need to verify if we have endpoints to potentially start leading
+				hasLocalEndpoints := l2a.HasLocalEndpoint(ss.svc)
+				svcName := ss.svc.Name
+
+				// Log the current state for observability
+				l2a.params.Logger.Info("LUIS Checking local endpoints",
+					"service", svcName,
+					"hasLocalEndpoints", hasLocalEndpoints,
+					"currentlyLeader", ss.currentlyLeader)
+
+				if !hasLocalEndpoints {
+					// No local endpoints, must release leadership
+					l2a.params.Logger.Info("LUIS Leader lost all local endpoints, releasing leadership",
+						"service", svcName)
+					if err := l2a.delSvc(serviceKey(ss.svc)); err != nil {
+						l2a.params.Logger.Error(fmt.Sprintf("LUIS Failed to delete service: %v", err),
+							"service", svcName)
+					}
+					l2a.params.Logger.Info("LUIS released leadership",
+						"service", svcName)
+				}
+			}
+		}
+
+	default:
+		return nil
+	}
+
+	return nil
 }
